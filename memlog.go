@@ -3,17 +3,29 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
-	"os"
 	"strings"
 	"sync"
 )
 
-const logSize = 1024
-const maxMemLine = 64
-const lineTrunc = "<... truncated>\n"
+type lineBuffer struct {
+	buffer         []byte
+	size, linesize int
+	trunc          string
+	start, end     int
+	length         int
+	closed         bool
+	sync.Mutex
+}
+
+type lineBufferReader struct {
+	lb       *lineBuffer
+	size     int
+	position int
+}
 
 type memlogentry struct {
 	tag string
@@ -21,21 +33,36 @@ type memlogentry struct {
 }
 
 type memlog struct {
-	entry      memlogentry
-	log        []byte
-	start, end int
-	closed     bool
-	sync.Mutex
+	entry memlogentry
+	log   *lineBuffer
 }
 
-type memreader struct {
-	log      *memlog
-	size     int
-	position int
+func newlineBuffer(buffsize, linesize int, truncstr string) *lineBuffer {
+	if !strings.HasSuffix(truncstr, "\n") {
+		truncstr += "\n"
+	}
+	if linesize > buffsize {
+		linesize = buffsize
+	}
+	l := &lineBuffer{
+		buffer:   make([]byte, buffsize),
+		size:     buffsize,
+		linesize: linesize,
+		trunc:    truncstr,
+		length:   0,
+		closed:   false,
+	}
+	return l
 }
 
-// writeLine writes a line to the memlog, up to maxMemLine length
-func (m *memlog) writeLine(line string) {
+func (m *lineBuffer) close() {
+	m.Lock()
+	defer m.Unlock()
+	m.closed = true
+}
+
+// writeLine writes a line to the memlog, up to m.linesize length
+func (m *lineBuffer) writeLine(line string) {
 	m.Lock()
 	defer m.Unlock()
 	if m.closed {
@@ -45,72 +72,119 @@ func (m *memlog) writeLine(line string) {
 		line = line + "\n"
 	}
 	var lbytes []byte
-	if len(line) > maxMemLine {
-		lbytes = make([]byte, maxMemLine)
-		copy(lbytes, []byte(line)[0:(maxMemLine-len(lineTrunc))])
-		copy(lbytes[maxMemLine-len(lineTrunc):maxMemLine], []byte(lineTrunc))
+	if len(line) > m.linesize {
+		lbytes = make([]byte, m.linesize)
+		copy(lbytes, []byte(line)[0:(m.linesize-len(m.trunc))])
+		copy(lbytes[m.linesize-len(m.trunc):m.linesize], []byte(m.trunc))
 	} else {
 		lbytes = []byte(line)
 	}
 	lsize := len(lbytes)
-	fmt.Printf("DEBUG: line is '%s', start: %d, end: %d, len: %d\n", strings.TrimRight(string(lbytes), "\n"), m.start, m.end, lsize)
-	if m.end+lsize > logSize { // wrap
-		tailSize := m.end + lsize - logSize
-		copy(m.log[m.end:], lbytes[0:(tailSize)])
-		headSize := lsize - tailSize
-		copy(m.log[0:], lbytes[headSize:])
-		m.end = m.end + lsize - logSize
-		fmt.Printf("DEBUG new end is: %d\n", m.end)
-		offset := bytes.IndexByte(m.log[m.end+1:logSize], byte('\n'))
-		fmt.Printf("DEBUG offiset is: %d\n", offset)
-		m.start = m.end + 1 + offset + 1
-		fmt.Printf("DEBUG new start is: %d\n", m.start)
-	} else {
-		copy(m.log[m.end:], lbytes)
-		if m.end >= m.start {
-			m.end += len(lbytes)
+	// Copy string and move m.end
+	copied := copy(m.buffer[m.end:], lbytes)
+	if copied != lsize {
+		copy(m.buffer, lbytes[copied:])
+	}
+	fallbackStart := m.end
+	if fallbackStart == m.size {
+		fallbackStart = 0
+	}
+	m.end += lsize
+	if m.end > m.size {
+		m.end -= m.size
+	}
+	if lsize == m.size {
+		m.length = m.size
+		return
+	}
+	m.length += lsize
+	if m.length > m.size {
+		// overlap - end passed start, need to move start and shorten
+		if m.end == m.size {
+			m.start = 0
 		} else {
-			if m.end+len(lbytes) > m.start {
-				offset := bytes.IndexByte(m.log[m.end+len(lbytes):], byte('\n'))
-				m.start += offset
-			}
-			m.end += len(lbytes)
+			m.start = m.end
+		}
+		m.length = m.size
+		// Now scan for the next newline and move start to there
+		limit := m.size - lsize
+		inc := bytes.IndexByte(m.buffer[m.start:], byte('\n'))
+		if inc == -1 {
+			inc = len(m.buffer[m.start:])
+			inc += bytes.IndexByte(m.buffer, byte('\n'))
+		}
+		// move start past the "\n"
+		inc++
+		if inc >= limit {
+			// use fallback
+			m.start = fallbackStart
+			m.length = lsize
+			return
+		}
+		m.length -= inc
+		m.start += inc
+		if m.start >= m.size {
+			m.start -= m.size
 		}
 	}
 }
 
 // getReader returns a memreader from a memlog
-func (m *memlog) getReader() memreader {
-	mr := memreader{
-		log:      m,
-		position: 0,
+func (m *lineBuffer) getReader() (lineBufferReader, error) {
+	m.Lock()
+	defer m.Unlock()
+	if !m.closed {
+		return lineBufferReader{}, errors.New("Not closed")
 	}
-	if m.end >= m.start {
-		mr.size = m.end - m.start
-	} else {
-		mr.size = logSize - (m.start - m.end)
+	mr := lineBufferReader{
+		lb:       m,
+		position: 0,
+		size:     m.length,
+	}
+	return mr, nil
+}
+
+// copyReader locks the linebuffer and returns a reader for
+// a copy.
+func (m *lineBuffer) copyReader() lineBufferReader {
+	m.Lock()
+	defer m.Unlock()
+	lb := &lineBuffer{
+		buffer: make([]byte, m.size),
+		size:   m.size,
+		start:  m.start,
+		end:    m.end,
+		length: m.length,
+		closed: true,
+		Mutex:  sync.Mutex{},
+	}
+	copy(lb.buffer, m.buffer)
+	mr := lineBufferReader{
+		lb:       lb,
+		position: 0,
+		size:     m.length,
 	}
 	return mr
 }
 
 // Read implements Read() for a memlog
-func (mr memreader) Read(p []byte) (int, error) {
+func (mr lineBufferReader) Read(p []byte) (int, error) {
 	rsize := len(p)
 	eof := false
 	if mr.position+rsize > mr.size {
 		eof = true
 		rsize = mr.size - mr.position
 	}
-	m := mr.log
+	m := mr.lb
 	rpos := m.start + mr.position
-	if rpos > logSize {
-		rpos -= logSize
+	if rpos > m.size {
+		rpos -= m.size
 	}
-	if rpos+rsize <= logSize {
-		copy(p, m.log[rpos:rpos+rsize])
+	if rpos+rsize <= m.size {
+		copy(p, m.buffer[rpos:rpos+rsize])
 	} else {
-		copy(p, m.log[rpos:logSize])
-		copy(p[len(m.log[rpos:logSize]):], m.log[0:rsize-len(m.log[rpos:logSize])])
+		copy(p, m.buffer[rpos:m.size])
+		copy(p[len(m.buffer[rpos:m.size]):], m.buffer[0:rsize-len(m.buffer[rpos:m.size])])
 	}
 	mr.position += rsize
 	if eof {
@@ -120,13 +194,7 @@ func (mr memreader) Read(p []byte) (int, error) {
 }
 
 func main() {
-	ml := &memlog{
-		log:    make([]byte, logSize),
-		start:  0,
-		end:    0,
-		closed: false,
-		Mutex:  sync.Mutex{},
-	}
+	ml := newlineBuffer(1024, 64, "<... truncated>")
 	for i := 0; i < 64; i++ {
 		var line string
 		if i%3 == 0 {
@@ -137,26 +205,33 @@ func main() {
 		} else {
 			line = fmt.Sprintf("Shortss line %d it doesn't have a newline", i)
 		}
-		pline := strings.TrimRight(line, "\n")
-		fmt.Printf("Writing line %d: %s, length: %d\n", i, pline, len(line))
 		ml.writeLine(line)
-		fmt.Printf("Buffer - start: %d, end: %d\n", ml.start, ml.end)
-		if ml.end < ml.start {
-			os.Stdout.Write(ml.log[ml.start:logSize])
-			os.Stdout.Write([]byte("|"))
-			os.Stdout.Write(ml.log[0:ml.end])
-		} else {
-			os.Stdout.Write(ml.log[ml.start:ml.end])
-		}
-		fmt.Println()
+		// pline := strings.TrimRight(line, "\n")
+		// fmt.Printf("Wrote line %d: %s, length: %d\n", i, pline, len(line))
+		// fmt.Printf("Buffer - start: %d, end: %d, length: %d\n", ml.start, ml.end, ml.length)
+		// out := make([]byte, ml.length, ml.length+1)
+		// copied := copy(out, ml.buffer[ml.start:])
+		// if ml.length > copied {
+		// 	out[copied] = '|'
+		// 	out = append(out, '\n')
+		// 	copy(out[copied+1:], ml.buffer)
+		// } else {
+		// 	out = append(out, '|')
+		// }
+		// os.Stdout.Write(out)
+		// fmt.Println()
 	}
-	fmt.Printf("Finished writing, start: %d, end: %d\n", ml.start, ml.end)
-	mlr := ml.getReader()
+	fmt.Printf("Finished writing, start: %d, end: %d, length: %d\n", ml.start, ml.end, ml.length)
+	ml.close()
+	mlr, err := ml.getReader()
+	if err != nil {
+		fmt.Printf("Getting reader: %v\n", err)
+	}
 	rl := bufio.NewScanner(mlr)
 	rlen := 0
 	for rl.Scan() {
 		line := rl.Text()
-		rlen += len(line)
+		rlen += len(line) + 1
 		fmt.Println(line)
 	}
 	fmt.Printf("Read %d bytes\n", rlen)
